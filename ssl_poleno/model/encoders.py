@@ -26,6 +26,6 @@ class BYOLPolenoEmbedding(nn.Module):
         self.encoder = NetWrapper(net, layer=emb_layer, projection_size=projection_size, projection_hidden_size=projection_hidden_size)  
         self.encoder.eval()
 
-    def forward(self, x):
-        with torch.no_grad():
+    def forward(self, x, no_grad=True):
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not no_grad):
             return self.encoder(x, return_projection=False)
