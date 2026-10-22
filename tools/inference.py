@@ -179,11 +179,12 @@ def inference(ckpt_path, conf, save_as="inference.npz"):
 
 if __name__ == "__main__":
 
-    ckpt_file = "checkpoints/hybrid2_lit_20260125_092737/last.ckpt"
+    ckpt_file = None
 
     parser = argparse.ArgumentParser(description='Path of the configuration file.')
     parser.add_argument('--ckpt', default=ckpt_file, type=str)
     parser.add_argument('--config', default=None, type=str)
+    parser.add_argument('--outfile', default="inference.npz", type=str)
     args = parser.parse_args()
 
     if args.config is None:
@@ -191,14 +192,14 @@ if __name__ == "__main__":
 
     print(f"Running inference with checkpoint: {args.ckpt} and config: {args.config}")
     
-    config_updates = {
-        "dataset": {
-            "root": "Z:/marvel/marvel-fhnw/data/",
-            "labels_test": "data/final/poleno/basic_test_20.csv",
-        }
-    }
+    # config_updates = {
+    #     "dataset": {
+    #         "root": "Z:/marvel/marvel-fhnw/data/",
+    #         "labels_test": "data/final/poleno/basic_test_20.csv",
+    #     }
+    # }
 
     conf = config.load(args.config)
-    conf = config.deep_update(conf, config_updates)
+    # conf = config.deep_update(conf, config_updates)
 
-    inference(args.ckpt, conf)
+    inference(args.ckpt, conf, save_as=args.outfile)

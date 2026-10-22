@@ -26,7 +26,7 @@ def limit_events_per_species(
 
 
 def load_inference_results(filename: str) -> pd.DataFrame:
-    data = np.load(filename)
+    data = np.load(filename, allow_pickle=True)
 
     def make_repr(emb_key, proj_key, files_key):
         d = {
@@ -42,4 +42,6 @@ def load_inference_results(filename: str) -> pd.DataFrame:
 
     df = pd.concat([repr1, repr2], ignore_index=True)
     labels_name = data.get("dataset")
+    if isinstance(labels_name, np.ndarray):
+        labels_name = labels_name.item() if labels_name.shape == () else labels_name.tolist()
     return df, labels_name

@@ -75,6 +75,22 @@ def select_month_labels(labels, month, year):
     return labels.loc[labels["capture_date"].dt.month.eq(month) & labels["capture_date"].dt.year.eq(year)].copy()
 
 
+def prepare_test_labels(labels, test_scope, year):
+    """Keep all test rows, including undated events, for full-dataset scenarios."""
+    if test_scope == "capture_date":
+        if year is None:
+            raise ValueError("Capture-date mode requires a year.")
+        dated = add_capture_dates(labels)
+        return dated.loc[dated["capture_date"].dt.year.eq(year)].copy()
+    if test_scope != "full_dataset":
+        raise ValueError(f"Unknown test scope: {test_scope}")
+    dated = labels.copy()
+    dates = (dated["capture_date"] if "capture_date" in dated else
+             dated["event_id"].astype("string").str.extract(r"_(\d{4}-\d{2}-\d{2})_", expand=False))
+    dated["capture_date"] = pd.to_datetime(dates, errors="coerce")
+    return dated
+
+
 def load_label_rows(representation_file, labels):
     """Load only image-0 embeddings, matching the preceding filter pipeline.
 
@@ -186,7 +202,9 @@ class SpeciesKNN:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--year", type=positive_int, required=True)
+    parser.add_argument("--year", type=positive_int,
+                        help="Capture year, or optional run label in full_dataset mode.")
+    parser.add_argument("--test-scope", choices=("capture_date", "full_dataset"), default="capture_date")
     parser.add_argument("--train-representations", required=True)
     parser.add_argument("--train-labels", required=True)
     parser.add_argument("--test-representations", nargs="+", required=True)
@@ -203,24 +221,38 @@ def parse_args(argv=None):
     parser.add_argument("--prediction-batch-size", type=positive_int, default=1000)
     parser.add_argument("--random-state", type=int, default=42)
     args = parser.parse_args(argv)
+    if args.test_scope == "capture_date" and args.year is None:
+        parser.error("--year is required when --test-scope is capture_date")
     if args.reference_mode == "active" and not args.monthly_species_json:
         parser.error("--monthly-species-json is required when --reference-mode is active")
     return args
 
 
-def select_known_events(labels, prediction_path):
-    """Match event IDs; exclude events with any unknown prediction."""
-    predictions = pd.read_csv(prediction_path, dtype={"event_id": str})
+def select_known_events(labels, prediction_path, *, scenario_month=None, scenario_year=None):
+    """Match retained events within one scenario; unknown votes veto only that scenario."""
+    predictions = (prediction_path if isinstance(prediction_path, pd.DataFrame) else
+                   pd.read_csv(prediction_path, dtype={"event_id": str}))
     if not {"event_id", "isknown_pred"}.issubset(predictions.columns):
         raise ValueError("Known predictions CSV requires event_id and isknown_pred columns.")
     if predictions["event_id"].isna().any() or not predictions["isknown_pred"].isin([0, 1]).all():
         raise ValueError("Known predictions CSV requires nonmissing event IDs and binary predictions.")
+    if scenario_month is not None:
+        if "scenario_month" not in predictions:
+            raise ValueError("Full-dataset mode requires scenario_month in the known predictions CSV.")
+        months = pd.to_numeric(predictions["scenario_month"], errors="coerce")
+        if not months.isin(range(1, 13)).all():
+            raise ValueError("Known predictions CSV has invalid scenario months.")
+        predictions = predictions.loc[months.eq(scenario_month)]
+        if scenario_year is not None and "scenario_year" in predictions:
+            predictions = predictions.loc[pd.to_numeric(predictions["scenario_year"], errors="coerce").eq(scenario_year)]
     known = set(predictions.loc[predictions["isknown_pred"].eq(1), "event_id"])
     unknown = set(predictions.loc[predictions["isknown_pred"].eq(0), "event_id"])
     return labels.loc[labels["event_id"].astype(str).isin(known - unknown)].copy()
 
 
 def run(args):
+    test_scope = getattr(args, "test_scope", "capture_date")
+    run_label = str(args.year) if args.year is not None else "full_dataset"
     output = Path(args.output_dir)
     if output.exists():
         raise FileExistsError(f"Choose a new output directory: {output}")
@@ -236,11 +268,16 @@ def run(args):
             raise ValueError(f"{name} labels contain missing event IDs.")
     if train["species"].isna().any() or train["species"].astype(str).str.strip().eq("").any():
         raise ValueError("Training rows must have species labels.")
-    dated = add_capture_dates(test)
-    dated = dated.loc[dated["capture_date"].dt.year.eq(args.year)].copy()
+    dated = prepare_test_labels(test, test_scope, args.year)
     if dated.empty:
-        raise ValueError(f"No test labels for year {args.year}.")
-    if args.known_predictions_csv:
+        raise ValueError(f"No test labels for scope {test_scope}, year {args.year}.")
+    known_predictions = None
+    if args.known_predictions_csv and test_scope == "full_dataset":
+        # Read once; filter independently inside each monthly scenario.
+        known_predictions = pd.read_csv(args.known_predictions_csv, dtype={"event_id": str},
+                                        usecols=lambda c: c in {"event_id", "isknown_pred", "scenario_month", "scenario_year"})
+        select_known_events(dated.iloc[:0], known_predictions, scenario_month=1, scenario_year=args.year)
+    elif args.known_predictions_csv:
         dated = select_known_events(dated, args.known_predictions_csv)
 
     print("Loading and sampling Poleno references once", flush=True)
@@ -258,7 +295,7 @@ def run(args):
     for column in ("scenario_year", "scenario_month", "reference_mode", "representation_file"):
         schema[column] = pd.Series(dtype=object)
     schema.to_csv(combined, index=False)
-    summary = {"config": vars(args), "reference_rows": len(references),
+    summary = {"test_scope": test_scope, "config": vars(args), "reference_rows": len(references),
                "test_files": test_files, "months": []}
 
     def save_summary():
@@ -270,8 +307,10 @@ def run(args):
         configured = seasonal[month] if seasonal is not None else available
         month_references = references.loc[references["species"].isin(configured)]
         model = all_model if all_model is not None else SpeciesKNN(month_references, n_neighbors=args.n_neighbors)
-        selected = select_month_labels(dated, month, args.year)
-        monthly_file = output / f"{args.year}_{month:02d}_{name}.csv"
+        selected = dated if test_scope == "full_dataset" else select_month_labels(dated, month, args.year)
+        if known_predictions is not None:
+            selected = select_known_events(selected, known_predictions, scenario_month=month, scenario_year=args.year)
+        monthly_file = output / f"{run_label}_{month:02d}_{name}.csv"
         schema.to_csv(monthly_file, index=False)
         report = {"month": month, "month_name": name, "configured_species": configured,
                   "reference_species": sorted(month_references["species"].unique()),
